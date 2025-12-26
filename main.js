@@ -3,70 +3,78 @@ import * as THREE from 'three';
 // --- НАЛАШТУВАННЯ СЦЕНИ ---
 const scene = new THREE.Scene();
 
-// Налаштування камери (OrthographicCamera краще підходить для 2D-ефектів, але Perspective цікавіше для 3D)
-const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+// Використовуємо OrthographicCamera (Ортогональна камера)
+// Вона прибирає перспективні викривлення, що ідеально для цього ефекту.
+// Але можна використати і PerspectiveCamera, якщо налаштувати setViewOffset.
+// Для початку спробуємо Perspective, але з правильною логікою viewOffset.
+const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 10000); 
+camera.position.z = 1000; // Відсуваємо камеру далеко
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.body.appendChild(renderer.domElement);
 
-// --- СТВОРЕННЯ ОБ'ЄКТА (СФЕРИ) ---
-// Використовуємо Wireframe (сітку), щоб було схоже на відео
-const geometry = new THREE.IcosahedronGeometry(2, 4); // Радіус 2, деталізація 4
+// --- СТВОРЕННЯ ОБ'ЄКТА ---
+// Робимо радіус більшим, оскільки камера далеко
+const geometry = new THREE.IcosahedronGeometry(300, 2); 
 const material = new THREE.MeshBasicMaterial({ 
-    color: 0xff0055, // Червонуватий колір
-    wireframe: true  // Режим сітки
+    color: 0xff0055, 
+    wireframe: true 
 });
 const sphere = new THREE.Mesh(geometry, material);
 scene.add(sphere);
 
-// --- ГОЛОВНА МАГІЯ: СИНХРОНІЗАЦІЯ ПОЗИЦІЇ ---
+// --- СИНХРОНІЗАЦІЯ ---
 
-function updateCameraPosition() {
-    // 1. Отримуємо розміри монітора (приблизні, бо браузер не завжди дає точні)
-    const monitorWidth = window.screen.availWidth;
-    const monitorHeight = window.screen.availHeight;
+function updateCamera() {
+    // 1. Отримуємо параметри всього монітора
+    const fullWidth = window.screen.width;
+    const fullHeight = window.screen.height;
 
-    // 2. Отримуємо позицію вікна на екрані
-    const windowX = window.screenX;
-    const windowY = window.screenY;
+    // 2. Отримуємо параметри поточного вікна
+    // Увага: window.screenX/Y включають рамки браузера.
+    // Нам потрібні координати саме контенту (canvas).
+    // Це складний момент, бо браузери по-різному рахують відступи.
+    
+    // Спробуємо компенсувати верхню панель браузера:
+    const barHeight = window.outerHeight - window.innerHeight;
+    
+    const x = window.screenX;
+    // Додаємо barHeight, якщо вважаємо, що відлік йде від верху вікна браузера, 
+    // але іноді краще просто window.screenY, якщо він вказує на контент.
+    // Для більшості випадків screenY вказує на верхній лівий кут ВІКНА, а не контенту.
+    const y = window.screenY + barHeight; 
+    
+    const w = window.innerWidth;
+    const h = window.innerHeight;
 
-    // 3. Знаходимо центр вікна
-    const centerX = windowX + (window.innerWidth / 2);
-    const centerY = windowY + (window.innerHeight / 2);
-
-    // 4. Обчислюємо зміщення від центру монітора
-    // (0, 0) сцени має бути в центрі монітора
-    const worldCenterX = monitorWidth / 2;
-    const worldCenterY = monitorHeight / 2;
-
-    // Зміщуємо сферу так, щоб вона завжди була по центру монітора
-    // Ми рухаємо сферу ПРОТИЛЕЖНО руху вікна
-    sphere.position.x = (worldCenterX - centerX) * 0.01; // 0.01 - коефіцієнт масштабу для сцени
-    sphere.position.y = -(worldCenterY - centerY) * 0.01; // Y інвертовано в 3D
+    // 3. МАГІЯ: setViewOffset
+    // Ми кажемо камері: "Твоє повне поле зору - це весь екран (fullWidth/Height).
+    // Але зараз рендери тільки прямокутник (x, y, w, h)".
+    
+    camera.setViewOffset(fullWidth, fullHeight, x, y, w, h);
+    
+    // Аспект камери тепер прив'язаний до повного екрану, а не вікна
+    camera.aspect = fullWidth / fullHeight;
+    camera.updateProjectionMatrix();
 }
 
-// --- АНІМАЦІЯ ---
 function animate() {
     requestAnimationFrame(animate);
 
-    // Оновлюємо позицію сфери відносно положення вікна
-    updateCameraPosition();
+    // Обертання за часом (Time based)
+    const t = Date.now() * 0.0005;
+    sphere.rotation.x = t;
+    sphere.rotation.y = t * 0.8;
 
-    // Додамо трохи обертання самій сфері для краси
-    sphere.rotation.x += 0.005;
-    sphere.rotation.y += 0.005;
-
+    updateCamera();
     renderer.render(scene, camera);
 }
 
-// --- ОБРОБКА ЗМІНИ РОЗМІРУ ВІКНА ---
+// --- ОБРОБКА ЗМІНИ РОЗМІРУ ---
 window.addEventListener('resize', () => {
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// Запуск
-camera.position.z = 5; // Відсуваємо камеру назад, щоб бачити сферу
 animate();

@@ -2,73 +2,79 @@ import * as THREE from 'three';
 
 // --- НАЛАШТУВАННЯ ---
 const scene = new THREE.Scene();
-const camera = new THREE.OrthographicCamera(0, 0, 0, 0, 0, 2000);
-camera.position.z = 1000;
 
-// Чорний фон
-scene.background = new THREE.Color(0x000000);
+// Використовуємо OrthographicCamera (як у твоїй базі)
+const camera = new THREE.OrthographicCamera(0, 0, 0, 0, 0, 1000);
+camera.position.z = 100;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.body.appendChild(renderer.domElement);
 
-// --- ТЕКСТУРА (Плавна, без білого центру) ---
-function getParticleTexture() {
-    const canvas = document.createElement('canvas');
-    canvas.width = 32;
-    canvas.height = 32;
-    const ctx = canvas.getContext('2d');
-    
-    ctx.clearRect(0, 0, 32, 32);
-
-    const gradient = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
-    // ЗМІНА: Робимо центр білим, але дуже прозорим.
-    // Основний колір буде задаватися в матеріалі.
-    gradient.addColorStop(0, 'rgba(255, 255, 255, 1)'); 
-    gradient.addColorStop(0.5, 'rgba(255, 255, 255, 0.2)');
-    gradient.addColorStop(1, 'rgba(0, 0, 0, 0)'); 
-    
-    ctx.fillStyle = gradient;
-    ctx.fillRect(0, 0, 32, 32);
-    
-    return new THREE.CanvasTexture(canvas);
-}
-const particleTexture = getParticleTexture();
-
-// --- МЕНЕДЖЕР ВІКОН ---
+// --- МЕНЕДЖЕР СТАНУ (LocalStorage) ---
 class WindowManager {
     constructor() {
         this.windows = {}; 
         this.id = `win_${Date.now()}_${Math.random()}`;
         this.winChangeCallback = null;
 
+        // 1. Одразу спробуємо почистити старі "завислі" вікна при старті
+        this.cleanGhosts();
+
+        // 2. Надійніше видалення при закритті
         window.addEventListener('beforeunload', () => {
             const wins = this.getWindows();
             delete wins[this.id];
             localStorage.setItem('windows', JSON.stringify(wins));
         });
 
-        window.addEventListener('storage', () => {
-            if (this.winChangeCallback) this.winChangeCallback();
+        window.addEventListener('storage', (event) => {
+            if (event.key === 'windows' && this.winChangeCallback) {
+                this.winChangeCallback();
+            }
         });
     }
 
     getWindows() {
-        try { return JSON.parse(localStorage.getItem('windows') || '{}'); } 
-        catch (e) { return {}; }
+        try {
+            return JSON.parse(localStorage.getItem('windows') || '{}');
+        } catch (e) {
+            return {};
+        }
+    }
+
+    // Нова функція для видалення старих даних
+    cleanGhosts() {
+        const wins = this.getWindows();
+        const now = Date.now();
+        let changed = false;
+
+        Object.keys(wins).forEach(id => {
+            // Якщо вікно не оновлювалось більше 500мс (було 1000) - видаляємо
+            if (now - wins[id].timestamp > 500) {
+                delete wins[id];
+                changed = true;
+            }
+        });
+
+        if (changed) {
+            localStorage.setItem('windows', JSON.stringify(wins));
+        }
     }
 
     update() {
         const wins = this.getWindows();
         const now = Date.now();
         
+        // Регулярна очистка
         Object.keys(wins).forEach(id => {
-            if (now - wins[id].timestamp > 1000 && id !== this.id) {
+            if (now - wins[id].timestamp > 500 && id !== this.id) {
                 delete wins[id];
             }
         });
 
+        // Оновлюємо себе
         wins[this.id] = {
             x: window.screenX,
             y: window.screenY,
@@ -86,82 +92,59 @@ class WindowManager {
 
 const winManager = new WindowManager();
 
-// --- СТВОРЕННЯ ОБ'ЄКТІВ ---
-const objects = new Map();
+// --- 3D ОБ'ЄКТИ ---
+const spheres = new Map();
 let connectionLine;
 
-function createComplexSphere() {
+// [ЗМІНЕНО] Функція тепер створює Групу з двох сфер (Ядро + Оболонка)
+function createSphere() {
     const group = new THREE.Group();
 
-    // 1. ЯДРО (Геометричне, чітке)
-    const coreGeo = new THREE.IcosahedronGeometry(70, 1);
+    // 1. ЯДРО (Лишаємо жорстким, як "серце")
+    const coreGeo = new THREE.IcosahedronGeometry(60, 2);
     const coreMat = new THREE.MeshBasicMaterial({ 
-        color: 0xff0044, // Малиновий
+        color: 0xff0050, 
         wireframe: true,
         transparent: true,
-        opacity: 0.8 // Яскраве ядро
+        opacity: 0.9 
     });
     const core = new THREE.Mesh(coreGeo, coreMat);
     group.add(core);
 
-    // 2. ХМАРА ЧАСТИНОК (Випадкова генерація)
-    // Замість Icosahedron ми генеруємо точки вручну
-    const particleCount = 1500; // Кількість точок
-    const geometry = new THREE.BufferGeometry();
-    const positions = new Float32Array(particleCount * 3);
-    const colors = new Float32Array(particleCount * 3);
-    const color = new THREE.Color();
-
-    for (let i = 0; i < particleCount; i++) {
-        // Випадкова точка на сфері (рівномірний розподіл)
-        // radius = від 80 до 100 (створює об'ємну оболонку, а не тонку шкірку)
-        const radius = 80 + Math.random() * 20; 
-        
-        // Сферичні координати
-        const phi = Math.acos(-1 + (2 * i) / particleCount);
-        const theta = Math.sqrt(particleCount * Math.PI) * phi;
-
-        const x = radius * Math.cos(theta) * Math.sin(phi);
-        const y = radius * Math.sin(theta) * Math.sin(phi);
-        const z = radius * Math.cos(phi);
-
-        positions[i * 3] = x;
-        positions[i * 3 + 1] = y;
-        positions[i * 3 + 2] = z;
-
-        // Колір: Тільки червоні відтінки
-        color.setHSL(0.98 + Math.random() * 0.04, 0.9, 0.5); // Червоний
-        colors[i * 3] = color.r;
-        colors[i * 3 + 1] = color.g;
-        colors[i * 3 + 2] = color.b;
-    }
-
-    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-
-    const particlesMat = new THREE.PointsMaterial({
-        map: particleTexture,
-        size: 5, // Середній розмір
-        vertexColors: true,
+    // 2. ОБОЛОНКА (Готуємо до деформації)
+    const shellGeo = new THREE.IcosahedronGeometry(100, 4); // Більше деталізації (4) для плавності хвиль
+    const shellMat = new THREE.MeshBasicMaterial({ 
+        color: 0xff0050, 
+        wireframe: true,
         transparent: true,
-        opacity: 0.6,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false // Це важливо! Точки не перекривають одна одну, а "світяться" разом
+        opacity: 0.3 
     });
+    const shell = new THREE.Mesh(shellGeo, shellMat);
+    
+    // ВАЖЛИВО: Зберігаємо початкові координати точок у пам'ять об'єкта
+    // Це потрібно, щоб ми могли накладати хвилі, не ламаючи форму назавжди
+    const pos = shellGeo.attributes.position;
+    const originalPositions = new Float32Array(pos.count * 3);
+    for (let i = 0; i < pos.count; i++) {
+        originalPositions[i * 3] = pos.getX(i);
+        originalPositions[i * 3 + 1] = pos.getY(i);
+        originalPositions[i * 3 + 2] = pos.getZ(i);
+    }
+    shell.userData.originalPositions = originalPositions; // Ховаємо в "кишеню" об'єкта
 
-    const particles = new THREE.Points(geometry, particlesMat);
-    group.add(particles);
+    group.add(shell);
 
     return group;
 }
 
 function createLine() {
-    // Лінія
+    // Використовуємо звичайну лінію, але з режимом накладання кольорів
     const material = new THREE.LineBasicMaterial({ 
-        color: 0xff0044, // Червона лінія (під колір сфер)
-        linewidth: 2,
+        color: 0xff0050, // Червоний колір, як у сфер
+        linewidth: 1,    
         transparent: true,
-        opacity: 0.5
+        opacity: 0.6,
+        blending: THREE.AdditiveBlending // Змушує лінію "світитися"
     });
     
     const geometry = new THREE.BufferGeometry().setFromPoints([
@@ -170,13 +153,14 @@ function createLine() {
     ]);
     
     const line = new THREE.Line(geometry, material);
-    line.frustumCulled = false;
+    line.frustumCulled = false; 
     return line;
 }
 
 function updateScene() {
     const wins = winManager.update();
     const myWin = wins[winManager.id];
+
     if (!myWin) return;
 
     const myCenterX = myWin.x + myWin.w / 2;
@@ -185,16 +169,17 @@ function updateScene() {
     const activeIds = Object.keys(wins);
     const sphereCenters = [];
 
+    // 1. ОНОВЛЕННЯ СФЕР
     activeIds.forEach(id => {
         const winData = wins[id];
         
-        if (!objects.has(id)) {
-            const group = createComplexSphere();
-            scene.add(group);
-            objects.set(id, group);
+        if (!spheres.has(id)) {
+            const mesh = createSphere();
+            scene.add(mesh);
+            spheres.set(id, mesh);
         }
 
-        const group = objects.get(id);
+        const group = spheres.get(id); // Тепер це група
 
         const otherCenterX = winData.x + winData.w / 2;
         const otherCenterY = winData.y + winData.h / 2;
@@ -205,34 +190,30 @@ function updateScene() {
         if (!isNaN(offsetX) && !isNaN(offsetY)) {
             group.position.set(offsetX, -offsetY, 0);
             
-            // Анімація
+            // [ЗМІНЕНО] Обертання
             const t = Date.now() * 0.001;
             
-            // Ядро крутиться чітко
+            // Ядро крутиться швидко в один бік
             group.children[0].rotation.y = t;
             group.children[0].rotation.x = t * 0.5;
 
-            // Хмара частинок крутиться повільніше і в інший бік (ефект об'єму)
-            group.children[1].rotation.y = -t * 0.2;
-            group.children[1].rotation.x = -t * 0.1;
-            
-            // Легка пульсація
-            const scale = 1 + Math.sin(t * 3) * 0.02;
-            group.scale.set(scale, scale, scale);
+            // Оболонка крутиться повільно в інший бік (ефект інтерференції)
+            group.children[1].rotation.y = -t * 0.5;
+            group.children[1].rotation.z = t * 0.2;
 
             sphereCenters.push(group.position.clone());
         }
     });
 
-    // Видалення
-    objects.forEach((group, id) => {
+    // Видалення старих
+    spheres.forEach((mesh, id) => {
         if (!wins[id]) {
-            scene.remove(group);
-            objects.delete(id);
+            scene.remove(mesh);
+            spheres.delete(id);
         }
     });
 
-    // Оновлення лінії
+    // 2. МАЛЮВАННЯ ЛІНІЇ
     if (!connectionLine) {
         connectionLine = createLine();
         scene.add(connectionLine);
@@ -240,8 +221,15 @@ function updateScene() {
 
     if (sphereCenters.length >= 2) {
         const pos = connectionLine.geometry.attributes.position.array;
-        pos[0] = sphereCenters[0].x; pos[1] = sphereCenters[0].y; pos[2] = 0;
-        pos[3] = sphereCenters[1].x; pos[4] = sphereCenters[1].y; pos[5] = 0;
+        
+        pos[0] = sphereCenters[0].x;
+        pos[1] = sphereCenters[0].y;
+        pos[2] = 0;
+        
+        pos[3] = sphereCenters[1].x;
+        pos[4] = sphereCenters[1].y;
+        pos[5] = 0;
+
         connectionLine.geometry.attributes.position.needsUpdate = true;
         connectionLine.visible = true;
     } else {
@@ -249,7 +237,8 @@ function updateScene() {
     }
 }
 
-// --- RESIZE ---
+// --- ГОЛОВНИЙ ЦИКЛ ---
+
 function resize() {
     const width = window.innerWidth;
     const height = window.innerHeight;
@@ -260,6 +249,7 @@ function resize() {
     camera.updateProjectionMatrix();
     renderer.setSize(width, height);
 }
+
 window.addEventListener('resize', resize);
 resize();
 
@@ -268,4 +258,5 @@ function animate() {
     updateScene();
     renderer.render(scene, camera);
 }
+
 animate();

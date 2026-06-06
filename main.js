@@ -1,43 +1,53 @@
 import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 
-// --- НАЛАШТУВАННЯ СЦЕНИ ---
+// --- СЦЕНА ---
 const scene = new THREE.Scene();
 
-// Камера (Orthographic ідеально підходить для цього ефекту)
 const camera = new THREE.OrthographicCamera(0, 0, 0, 0, 0, 2000);
 camera.position.z = 1000;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
 document.body.appendChild(renderer.domElement);
+
+// --- BLOOM POST-PROCESSING ---
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+
+const bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    1.4,   // strength
+    0.4,   // radius
+    0.05   // threshold
+);
+composer.addPass(bloomPass);
 
 // --- ТЕКСТУРА ЧАСТИНКИ ---
 function getParticleTexture() {
     const canvas = document.createElement('canvas');
-    canvas.width = 32;
-    canvas.height = 32;
+    canvas.width = 64;
+    canvas.height = 64;
     const ctx = canvas.getContext('2d');
-    
-    ctx.clearRect(0, 0, 32, 32);
-
-    // М'яке світіння
-    const gradient = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
-    gradient.addColorStop(0, 'rgba(255, 255, 255, 1)'); 
-    gradient.addColorStop(0.5, 'rgba(255, 255, 255, 0.2)'); 
-    gradient.addColorStop(1, 'rgba(0, 0, 0, 0)'); 
-    
+    const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gradient.addColorStop(0,   'rgba(255,255,255,1)');
+    gradient.addColorStop(0.3, 'rgba(255,255,255,0.6)');
+    gradient.addColorStop(1,   'rgba(0,0,0,0)');
     ctx.fillStyle = gradient;
-    ctx.fillRect(0, 0, 32, 32);
-    
+    ctx.fillRect(0, 0, 64, 64);
     return new THREE.CanvasTexture(canvas);
 }
 
 const particleTexture = getParticleTexture();
+
 // --- МЕНЕДЖЕР ВІКОН ---
 class WindowManager {
     constructor() {
-        this.windows = {}; 
         this.id = `win_${Date.now()}_${Math.random()}`;
         this.winChangeCallback = null;
 
@@ -53,16 +63,16 @@ class WindowManager {
     }
 
     getWindows() {
-        try { return JSON.parse(localStorage.getItem('windows') || '{}'); } 
+        try { return JSON.parse(localStorage.getItem('windows') || '{}'); }
         catch (e) { return {}; }
     }
 
     update() {
         const wins = this.getWindows();
         const now = Date.now();
-        
+
         Object.keys(wins).forEach(id => {
-            if (now - wins[id].timestamp > 1000 && id !== this.id) {
+            if (now - wins[id].timestamp > 1500 && id !== this.id) {
                 delete wins[id];
             }
         });
@@ -78,170 +88,212 @@ class WindowManager {
         localStorage.setItem('windows', JSON.stringify(wins));
         return wins;
     }
-
-    setWinChangeCallback(cb) { this.winChangeCallback = cb; }
 }
 
 const winManager = new WindowManager();
 
-// --- СТВОРЕННЯ ОБ'ЄКТІВ ---
-const spheres = new Map();
-let connectionLine;
+// --- ГЕНЕРАЦІЯ ТОЧОК СФЕРИ (хмарний вигляд) ---
+function randomSphericalPoints(count, radiusMin, radiusMax) {
+    const positions = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) {
+        const theta = Math.random() * Math.PI * 2;
+        const phi = Math.acos(2 * Math.random() - 1);
+        // Більше частинок ближче до поверхні
+        const t = Math.pow(Math.random(), 0.5);
+        const r = radiusMin + t * (radiusMax - radiusMin);
+        positions[i * 3]     = r * Math.sin(phi) * Math.cos(theta);
+        positions[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+        positions[i * 3 + 2] = r * Math.cos(phi);
+    }
+    return positions;
+}
 
-function createComplexSphere(shellColor, coreColor) {
+// --- СТВОРЕННЯ СФЕРИ ---
+function createSphereGroup(shellColor, coreColor) {
     const group = new THREE.Group();
-
-    // Спільний матеріал
-    const baseMaterial = new THREE.PointsMaterial({
+    const baseMat = {
         map: particleTexture,
         transparent: true,
         blending: THREE.AdditiveBlending,
         depthWrite: false,
         sizeAttenuation: true
-    });
+    };
 
-    // 1. ЯДРО (Core) - маленьке, щільне
-    const coreGeo = new THREE.IcosahedronGeometry(40, 4); 
-    const coreMat = baseMaterial.clone();
-    coreMat.color.setHex(coreColor);
-    coreMat.size = 3.0;
-    coreMat.opacity = 0.9;
-    const core = new THREE.Points(coreGeo, coreMat);
-    group.add(core); // index 0
+    // ЯДРО — щільне, яскраве
+    const coreGeo = new THREE.BufferGeometry();
+    coreGeo.setAttribute('position', new THREE.BufferAttribute(randomSphericalPoints(600, 0, 35), 3));
+    const coreMat = new THREE.PointsMaterial({ ...baseMat, color: coreColor, size: 3.5, opacity: 1.0 });
+    group.add(new THREE.Points(coreGeo, coreMat));
 
-    // 2. СЯЙВО (Glow) - середнє, розріджене
-    const glowGeo = new THREE.IcosahedronGeometry(60, 3);
-    const glowMat = baseMaterial.clone();
-    glowMat.color.setHex(coreColor);
-    glowMat.size = 4.0;
-    glowMat.opacity = 0.4;
-    const glow = new THREE.Points(glowGeo, glowMat);
-    group.add(glow); // index 1
+    // СЕРЕДНІЙ ШАР
+    const midGeo = new THREE.BufferGeometry();
+    midGeo.setAttribute('position', new THREE.BufferAttribute(randomSphericalPoints(1200, 25, 70), 3));
+    const midMat = new THREE.PointsMaterial({ ...baseMat, color: coreColor, size: 2.5, opacity: 0.5 });
+    group.add(new THREE.Points(midGeo, midMat));
 
-    // 3. ОБОЛОНКА (Shell) - велика, формує контур
-    const shellGeo = new THREE.IcosahedronGeometry(90, 5); 
-    const shellMat = baseMaterial.clone();
-    shellMat.color.setHex(shellColor);
-    shellMat.size = 1.5;
-    shellMat.opacity = 0.6;
-    const shell = new THREE.Points(shellGeo, shellMat);
-    
-    // Зберігаємо початкові координати для оболонки
-    const positions = shellGeo.attributes.position;
-    const originalPositions = new Float32Array(positions.count * 3);
-    for(let i = 0; i < positions.count; i++) {
-        originalPositions[i*3] = positions.getX(i);
-        originalPositions[i*3+1] = positions.getY(i);
-        originalPositions[i*3+2] = positions.getZ(i);
-    }
-    shell.geometry.userData = { originalPositions: originalPositions };
-    
-    group.add(shell); // index 2
+    // ОБОЛОНКА — велика, розріджена
+    const shellGeo = new THREE.BufferGeometry();
+    const shellPositions = randomSphericalPoints(2000, 55, 110);
+    shellGeo.setAttribute('position', new THREE.BufferAttribute(shellPositions, 3));
+    shellGeo.userData.originalPositions = shellPositions.slice();
+    const shellMat = new THREE.PointsMaterial({ ...baseMat, color: shellColor, size: 1.8, opacity: 0.45 });
+    group.add(new THREE.Points(shellGeo, shellMat));
 
     return group;
 }
 
-function createLine() {
-    const material = new THREE.LineBasicMaterial({ 
-        color: 0xffffff, 
-        linewidth: 2,
+// --- МІСТ З ЧАСТИНОК ---
+const BRIDGE_COUNT = 1800;
+
+function createBridgeSystem() {
+    const geo = new THREE.BufferGeometry();
+    const positions = new Float32Array(BRIDGE_COUNT * 3);
+    const colors = new Float32Array(BRIDGE_COUNT * 3);
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('color',    new THREE.BufferAttribute(colors,    3));
+
+    const mat = new THREE.PointsMaterial({
+        map: particleTexture,
         transparent: true,
-        opacity: 0.5,
-        blending: THREE.AdditiveBlending 
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        sizeAttenuation: true,
+        size: 2.2,
+        opacity: 0.7,
+        vertexColors: true
     });
-    
-    const geometry = new THREE.BufferGeometry().setFromPoints([
-        new THREE.Vector3(0, 0, 0), 
-        new THREE.Vector3(0, 0, 0)
-    ]);
-    
-    const line = new THREE.Line(geometry, material);
-    line.frustumCulled = false;
-    return line;
+
+    const points = new THREE.Points(geo, mat);
+    points.frustumCulled = false;
+    return points;
 }
 
+function updateBridge(bridge, posA, posB, colorA, colorB) {
+    const positions = bridge.geometry.attributes.position.array;
+    const colors    = bridge.geometry.attributes.color.array;
+
+    const cA = new THREE.Color(colorA);
+    const cB = new THREE.Color(colorB);
+
+    const dir = new THREE.Vector3().subVectors(posB, posA);
+    const len = dir.length();
+    dir.normalize();
+
+    // Перпендикулярні вектори для розкиду навколо осі
+    const perp1 = new THREE.Vector3();
+    const perp2 = new THREE.Vector3();
+    if (Math.abs(dir.x) < 0.9) perp1.set(1, 0, 0);
+    else perp1.set(0, 1, 0);
+    perp1.crossVectors(dir, perp1).normalize();
+    perp2.crossVectors(dir, perp1).normalize();
+
+    for (let i = 0; i < BRIDGE_COUNT; i++) {
+        // t ∈ [0,1] — позиція вздовж мосту
+        const t = Math.random();
+
+        // Радіус поперечного розкиду: товщий біля сфер, тонший посередині
+        // Форма "гантелі" / "пісочного годинника": sin(π·t)
+        const edgeFactor = Math.sin(Math.PI * t);
+        const maxRadius = 28;
+        const radialSpread = maxRadius * (1.0 - edgeFactor * 0.75) * Math.pow(Math.random(), 0.5);
+        const angle = Math.random() * Math.PI * 2;
+
+        const radX = Math.cos(angle) * radialSpread;
+        const radY = Math.sin(angle) * radialSpread;
+
+        positions[i * 3]     = posA.x + dir.x * t * len + perp1.x * radX + perp2.x * radY;
+        positions[i * 3 + 1] = posA.y + dir.y * t * len + perp1.y * radX + perp2.y * radY;
+        positions[i * 3 + 2] = posA.z + dir.z * t * len + perp1.z * radX + perp2.z * radY;
+
+        // Колір: плавний перехід від A до B
+        const c = cA.clone().lerp(cB, t);
+        colors[i * 3]     = c.r;
+        colors[i * 3 + 1] = c.g;
+        colors[i * 3 + 2] = c.b;
+    }
+
+    bridge.geometry.attributes.position.needsUpdate = true;
+    bridge.geometry.attributes.color.needsUpdate    = true;
+}
+
+// --- СТАН СЦЕНИ ---
+const spheres  = new Map();
+const COLOR_GREEN = 0x00ff88;
+const COLOR_RED   = 0xff0050;
+
+let bridge = createBridgeSystem();
+scene.add(bridge);
+bridge.visible = false;
+
+// --- ОНОВЛЕННЯ СЦЕНИ ---
 function updateScene() {
     const wins = winManager.update();
     const myWin = wins[winManager.id];
-
     if (!myWin) return;
 
     const activeIds = Object.keys(wins).sort();
-    
-    const myCenterX = myWin.x + myWin.w / 2;
-    const myCenterY = myWin.y + myWin.h / 2;
+    const myCX = myWin.x + myWin.w / 2;
+    const myCY = myWin.y + myWin.h / 2;
 
-    const sphereCenters = [];
     const time = Date.now() * 0.0005;
+    const spherePositions = [];
 
-    // Неонові кольори з репозиторію
-    const COLOR_RED = 0xff0050;   
-    const COLOR_GREEN = 0x00ff88; 
-
-    // --- ОНОВЛЕННЯ СФЕР ---
-    activeIds.forEach(id => {
+    // --- СФЕРИ ---
+    activeIds.forEach((id, index) => {
         const winData = wins[id];
-        const index = activeIds.indexOf(id);
-        
-        // Визначаємо кольори
-        let shellColorVal = (index % 2 === 0) ? COLOR_GREEN : COLOR_RED;
-        let coreColorVal  = (index % 2 === 0) ? COLOR_RED : COLOR_GREEN;
+        const shellColor = (index % 2 === 0) ? COLOR_GREEN : COLOR_RED;
+        const coreColor  = (index % 2 === 0) ? COLOR_RED   : COLOR_GREEN;
 
-        // Перевірка: чи існує сфера і чи має вона правильну структуру (3 дітей)
         let group = spheres.get(id);
-        
         if (!group || group.children.length !== 3) {
-            // Якщо сфера стара або пошкоджена - видаляємо і створюємо нову
             if (group) scene.remove(group);
-            group = createComplexSphere(shellColorVal, coreColorVal);
+            group = createSphereGroup(shellColor, coreColor);
             scene.add(group);
             spheres.set(id, group);
         }
 
-        group.children[0].material.color.setHex(coreColorVal);
-        group.children[1].material.color.setHex(coreColorVal);
-        group.children[2].material.color.setHex(shellColorVal);
-        
-        // Позиція
-        const otherCenterX = winData.x + winData.w / 2;
-        const otherCenterY = winData.y + winData.h / 2;
-        const spherePos = new THREE.Vector3(
-            otherCenterX - myCenterX,
-            -(otherCenterY - myCenterY),
-            0
-        );
-        group.position.copy(spherePos);
+        // Оновлення кольорів
+        group.children[0].material.color.setHex(coreColor);
+        group.children[1].material.color.setHex(coreColor);
+        group.children[2].material.color.setHex(shellColor);
 
-        // Анімація обертання
-        group.children[0].rotation.y = time;
+        // Позиція в локальному просторі вікна
+        const wCX = winData.x + winData.w / 2;
+        const wCY = winData.y + winData.h / 2;
+        const pos = new THREE.Vector3(wCX - myCX, -(wCY - myCY), 0);
+        group.position.copy(pos);
+
+        // Обертання
+        group.children[0].rotation.y = time * 1.2;
         group.children[1].rotation.y = time;
-        group.children[2].rotation.y = -time * 0.5;
-        group.children[2].rotation.x = Math.sin(time * 0.5) * 0.2;
+        group.children[1].rotation.z = time * 0.3;
+        group.children[2].rotation.y = -time * 0.6;
+        group.children[2].rotation.x = Math.sin(time * 0.7) * 0.3;
 
-        // Ефект тяжіння
-        let centerX = 0, centerY = 0;
+        // Ефект притягання до центру групи вікон
+        let cx = 0, cy = 0;
         activeIds.forEach(wid => {
-            centerX += wins[wid].x + wins[wid].w / 2;
-            centerY += wins[wid].y + wins[wid].h / 2;
+            cx += wins[wid].x + wins[wid].w / 2;
+            cy += wins[wid].y + wins[wid].h / 2;
         });
-        centerX /= activeIds.length;
-        centerY /= activeIds.length;
+        cx /= activeIds.length;
+        cy /= activeIds.length;
+        const centroid = new THREE.Vector3(cx - myCX, -(cy - myCY), 0);
 
-        const localCentroid = new THREE.Vector3(centerX - myCenterX, -(centerY - myCenterY), 0);
-        group.lookAt(localCentroid);
-
-        const distToCenter = spherePos.distanceTo(localCentroid);
-        if (distToCenter < 400 && activeIds.length > 1) {
-            const stretch = Math.max(0, 1 - (distToCenter / 400));
-            group.scale.z = 1 + stretch * 0.5;
+        const distToCenter = pos.distanceTo(centroid);
+        if (distToCenter < 500 && activeIds.length > 1) {
+            group.lookAt(centroid);
+            const stretch = Math.max(0, 1 - distToCenter / 500);
+            group.scale.z = 1 + stretch * 0.8;
         } else {
+            group.rotation.set(0, 0, 0);
             group.scale.set(1, 1, 1);
         }
 
-        sphereCenters.push(group.position.clone());
+        spherePositions.push({ pos, shellColor, coreColor });
     });
 
-    // Видалення "мертвих" сфер
+    // Видалення мертвих сфер
     spheres.forEach((mesh, id) => {
         if (!wins[id]) {
             scene.remove(mesh);
@@ -249,40 +301,35 @@ function updateScene() {
         }
     });
 
-    // --- ЛІНІЯ ---
-    if (!connectionLine) {
-        connectionLine = createLine();
-        scene.add(connectionLine);
-    }
-
-    if (sphereCenters.length >= 2) {
-        const pos = connectionLine.geometry.attributes.position.array;
-        pos[0] = sphereCenters[0].x; pos[1] = sphereCenters[0].y; pos[2] = 0;
-        pos[3] = sphereCenters[1].x; pos[4] = sphereCenters[1].y; pos[5] = 0;
-        connectionLine.geometry.attributes.position.needsUpdate = true;
-        connectionLine.visible = true;
+    // --- МІСТ ---
+    if (spherePositions.length >= 2) {
+        const a = spherePositions[0];
+        const b = spherePositions[1];
+        updateBridge(bridge, a.pos, b.pos, a.shellColor, b.shellColor);
+        bridge.visible = true;
     } else {
-        connectionLine.visible = false;
+        bridge.visible = false;
     }
 }
 
-// --- ГОЛОВНИЙ ЦИКЛ ---
+// --- RESIZE ---
 function resize() {
-    const width = window.innerWidth;
-    const height = window.innerHeight;
-    camera.left = -width / 2;
-    camera.right = width / 2;
-    camera.top = height / 2;
-    camera.bottom = -height / 2;
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    camera.left   = -w / 2; camera.right  =  w / 2;
+    camera.top    =  h / 2; camera.bottom = -h / 2;
     camera.updateProjectionMatrix();
-    renderer.setSize(width, height);
+    renderer.setSize(w, h);
+    composer.setSize(w, h);
+    bloomPass.resolution.set(w, h);
 }
 window.addEventListener('resize', resize);
 resize();
 
+// --- АНІМАЦІЯ ---
 function animate() {
     requestAnimationFrame(animate);
     updateScene();
-    renderer.render(scene, camera);
+    composer.render();
 }
 animate();

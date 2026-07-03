@@ -24,7 +24,7 @@ composer.addPass(new RenderPass(scene, camera));
 
 const bloomPass = new UnrealBloomPass(
     new THREE.Vector2(window.innerWidth, window.innerHeight),
-    0.9,   // strength
+    0.55,  // strength
     0.7,   // radius
     0.0    // threshold
 );
@@ -148,11 +148,14 @@ uniform float uTongueAmp;
 uniform float uSpeed;
 uniform float uSpin;
 uniform float uOpacity;
+uniform float uBaseDensity;
+uniform float uTongueDensity;
+uniform float uRimDensity;
+uniform float uRimAlpha;
+uniform float uRimSharp;
 uniform vec3  uReachDir;
 uniform float uReachAmount;
 uniform float uReachLen;
-
-attribute float aRandom;
 
 varying float vGlow;
 varying float vAlpha;
@@ -160,9 +163,13 @@ varying float vAlpha;
 ${SNOISE_GLSL}
 
 vec3 rotY(vec3 p, float a){ float c=cos(a), s=sin(a); return vec3(c*p.x + s*p.z, p.y, -s*p.x + c*p.z); }
+float hash13 (vec3 p){ return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453); }
+float hash13b(vec3 p){ return fract(sin(dot(p, vec3(39.346, 11.135, 83.155))) * 24634.6345); }
 
 void main(){
     vec3 dir = normalize(position);
+    float h  = hash13(dir);
+    float h2 = hash13b(dir);   // незалежний хеш — рішення "показати/приховати"
 
     // Шумове поле, що повільно обертається і дрейфує — "тканина", що дихає
     vec3 np = rotY(dir, uTime * uSpin);
@@ -172,9 +179,25 @@ void main(){
 
     // "Язики полум'я" — м'які виступи лише там, де шум високий
     float tongue = pow(max(n, 0.0), 1.8);
-    float disp = uNoiseAmp * n + uTongueAmp * tongue;
 
-    float baseR = uRadius + (aRandom - 0.5) * uThickness;
+    // Контур (силует) сфери: яскравіше там, де нормаль перпендикулярна до погляду.
+    // uRimSharp керує ТОВЩИНОЮ кільця: більше значення => тонший контур точно по краю.
+    vec3 vn = normalize((modelViewMatrix * vec4(dir, 0.0)).xyz);
+    float rim = pow(1.0 - abs(vn.z), uRimSharp);
+
+    // Щільність точок: рідко на гладкій поверхні, густо на язиках і по краю кола
+    float nl   = clamp(n * 0.5 + 0.5, 0.0, 1.0);
+    float prob = uBaseDensity
+               + uTongueDensity * smoothstep(0.45, 0.95, nl)
+               + uRimDensity    * rim;
+    if (h2 > prob) {                       // приховуємо зайві точки (за межі кадру)
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+        return;
+    }
+
+    // Зміщення радіуса (тканина) + язики
+    float disp = uNoiseAmp * n + uTongueAmp * tongue;
+    float baseR = uRadius + (h - 0.5) * uThickness;
     vec3 pos = dir * (baseR + disp);
 
     // Тяжіння до сусідньої сфери (злиття): бік, повернутий до неї, витягується
@@ -182,12 +205,12 @@ void main(){
     float reach = pow(facing, 3.0) * uReachAmount;
     pos += uReachDir * reach * uReachLen;
 
-    vGlow  = tongue;
-    vAlpha = uOpacity * (0.45 + 0.75 * tongue) * (0.65 + 0.7 * aRandom);
+    vGlow  = tongue * 0.8 + rim * 0.5;
+    vAlpha = uOpacity * (0.20 + 0.9 * tongue + uRimAlpha * rim);
 
     vec4 mv = modelViewMatrix * vec4(pos, 1.0);
     gl_Position = projectionMatrix * mv;
-    gl_PointSize = uSize * uPixelRatio * (0.6 + 0.8 * aRandom) * (1.0 + 0.7 * tongue);
+    gl_PointSize = uSize * uPixelRatio * (0.6 + 0.7 * h) * (1.0 + 0.6 * tongue + 0.4 * rim);
 }
 `;
 
@@ -196,42 +219,32 @@ uniform vec3 uColor;
 varying float vGlow;
 varying float vAlpha;
 void main(){
+    // М'яка кругла мікро-точка
     float d = length(gl_PointCoord - vec2(0.5));
     if (d > 0.5) discard;
     float a = smoothstep(0.5, 0.0, d);
-    a = pow(a, 1.5);
-    vec3 col = uColor * (1.0 + vGlow * 0.9);
+    a = pow(a, 1.4);
+    vec3 col = uColor * (1.0 + vGlow * 0.5);
     gl_FragColor = vec4(col, a * vAlpha);
 }
 `;
 
-// --- ГЕОМЕТРІЯ ОБОЛОНКИ: рівномірний розподіл (Фібоначчі) — без сітки ---
+// --- ГЕОМЕТРІЯ МЕМБРАНИ: хмара мікро-точок на сфері ---
+// Рівномірний ВИПАДКОВИЙ розподіл по сфері (z рівномірно, кут рівномірно) => жодної
+// регулярної структури: ні меридіанів/паралелей, ні ліній сітки. Лише дрібне зерно,
+// що при щільності читається як напівпрозора тканина ("обгортка" з мікрокрапок).
 function buildShellGeometry(count) {
     const positions = new Float32Array(count * 3);
-    const randoms   = new Float32Array(count);
-    const golden    = Math.PI * (3 - Math.sqrt(5));
-
     for (let i = 0; i < count; i++) {
-        let y = 1 - (i / (count - 1)) * 2;          // [1, -1]
-        const r = Math.sqrt(Math.max(0, 1 - y * y));
-        const theta = golden * i;
-        let x = Math.cos(theta) * r;
-        let z = Math.sin(theta) * r;
-
-        // Невеликий джиттер, щоб прибрати будь-яку залишкову регулярність
-        x += (Math.random() - 0.5) * 0.03;
-        y += (Math.random() - 0.5) * 0.03;
-        z += (Math.random() - 0.5) * 0.03;
-
-        positions[i * 3]     = x;
-        positions[i * 3 + 1] = y;
+        const z = 2 * Math.random() - 1;
+        const t = 2 * Math.PI * Math.random();
+        const r = Math.sqrt(Math.max(0, 1 - z * z));
+        positions[i * 3]     = r * Math.cos(t);
+        positions[i * 3 + 1] = r * Math.sin(t);
         positions[i * 3 + 2] = z;
-        randoms[i] = Math.random();
     }
-
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geo.setAttribute('aRandom',  new THREE.BufferAttribute(randoms, 1));
     return geo;
 }
 
@@ -247,9 +260,14 @@ function makeShellMaterial(color, opts) {
             uNoiseFreq:   { value: opts.freq },
             uNoiseAmp:    { value: opts.amp },
             uTongueAmp:   { value: opts.tongue },
-            uSpeed:       { value: opts.speed },
-            uSpin:        { value: opts.spin },
-            uOpacity:     { value: opts.opacity },
+            uSpeed:        { value: opts.speed },
+            uSpin:         { value: opts.spin },
+            uOpacity:      { value: opts.opacity },
+            uBaseDensity:  { value: opts.baseDensity },
+            uTongueDensity:{ value: opts.tongueDensity },
+            uRimDensity:   { value: opts.rimDensity },
+            uRimAlpha:     { value: opts.rimAlpha },
+            uRimSharp:     { value: opts.rimSharp },
             uReachDir:    { value: new THREE.Vector3(0, 0, 0) },
             uReachAmount: { value: 0 },
             uReachLen:    { value: opts.reachLen },
@@ -278,38 +296,44 @@ function randomSphericalPoints(count, radiusMin, radiusMax) {
 }
 
 // --- СТВОРЕННЯ ГРУПИ СФЕРИ ---
-// children[0] — зовнішня оболонка (shellColor)
-// children[1] — внутрішня оболонка (coreColor)
+// children[0] — зовнішня мембрана Points (shellColor)
+// children[1] — внутрішня мембрана Points (coreColor)
 // children[2] — об'ємне ядро Points (coreColor)
+// frustumCulled=false скрізь: базова геометрія одинична, тож three.js рахує крихітну
+// bounding sphere і викидав би накриту фігуру, коли її центр виходить за межі вікна.
 function createSphereGroup(shellColor, coreColor) {
     const group = new THREE.Group();
 
-    // Зовнішня оболонка — велика щільна мембрана з м'якими "язиками"
+    // Зовнішня мембрана — "тканина" з мікро-точок: рідка на гладкому, густа на язиках і по краю
     const outerShell = new THREE.Points(
-        buildShellGeometry(26000),
+        buildShellGeometry(75000),
         makeShellMaterial(shellColor, {
-            size: 2.2, radius: 102, thickness: 7,
-            freq: 1.25, amp: 4, tongue: 36,
-            speed: 0.22, spin: 0.05, opacity: 0.42, reachLen: 1.0,
+            size: 1.4, radius: 100, thickness: 4,
+            freq: 1.6, amp: 3, tongue: 11,
+            speed: 0.22, spin: 0.05, opacity: 0.32, reachLen: 1.0,
+            baseDensity: 0.10, tongueDensity: 0.85, rimDensity: 0.85, rimAlpha: 0.9, rimSharp: 9.0,
         })
     );
+    outerShell.frustumCulled = false;
     group.add(outerShell);
 
-    // Внутрішня оболонка — менша, щільніша, обертається в інший бік
+    // Внутрішня мембрана — менша, щільніша, обертається в інший бік
     const innerShell = new THREE.Points(
-        buildShellGeometry(11000),
+        buildShellGeometry(28000),
         makeShellMaterial(coreColor, {
-            size: 2.1, radius: 60, thickness: 6,
-            freq: 1.7, amp: 3, tongue: 18,
-            speed: 0.30, spin: -0.08, opacity: 0.4, reachLen: 0.55,
+            size: 1.3, radius: 60, thickness: 4,
+            freq: 2.0, amp: 2.5, tongue: 8,
+            speed: 0.30, spin: -0.08, opacity: 0.24, reachLen: 0.55,
+            baseDensity: 0.13, tongueDensity: 0.65, rimDensity: 0.5, rimAlpha: 0.5, rimSharp: 7.0,
         })
     );
+    innerShell.frustumCulled = false;
     group.add(innerShell);
 
-    // Ядро — м'яка хмара частинок (стримана гаряча серцевина)
+    // Ядро — щільна хмара дрібних частинок (стримана гаряча серцевина)
     const coreGeo = new THREE.BufferGeometry();
     coreGeo.setAttribute('position', new THREE.BufferAttribute(
-        randomSphericalPoints(1000, 0, 36), 3
+        randomSphericalPoints(1200, 0, 34), 3
     ));
     const coreMat = new THREE.PointsMaterial({
         map: particleTexture,
@@ -319,10 +343,12 @@ function createSphereGroup(shellColor, coreColor) {
         depthTest: false,
         sizeAttenuation: true,
         color: coreColor,
-        size: 3.5,
-        opacity: 0.5,
+        size: 2.2,
+        opacity: 0.38,
     });
-    group.add(new THREE.Points(coreGeo, coreMat));
+    const core = new THREE.Points(coreGeo, coreMat);
+    core.frustumCulled = false;
+    group.add(core);
 
     return group;
 }
@@ -460,8 +486,8 @@ function updateBridge(bridge, posA, posB, colorA, colorB) {
 
 // --- СТАН СЦЕНИ ---
 const spheres     = new Map();
-const COLOR_GREEN = 0x33ff66;
-const COLOR_RED   = 0xff1840;
+const COLOR_GREEN = 0x63ffa6;   // м'ятно-зелений — з Приклад.webp
+const COLOR_RED   = 0xff2a64;   // малиновий — з Фото.png
 
 let bridge = createBridgeSystem();
 scene.add(bridge);

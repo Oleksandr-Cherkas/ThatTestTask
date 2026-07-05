@@ -3,14 +3,20 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 
-// --- СЦЕНА ---
+// --- Сцена / Scene ---
 const scene = new THREE.Scene();
 
+// Ортокамера з масштабом "1 юніт = 1 піксель екрана" (див. resize()). На цьому
+// тримається весь фокус із вікнами: сфери живуть в екранних координатах, тож у
+// кожному вікні опиняються на тому самому місці.
+// Ortho camera scaled so 1 unit == 1 screen pixel (see resize()). This is what the
+// whole multi-window trick rides on: spheres live in screen space, so every window
+// puts them at the same absolute spot.
 const camera = new THREE.OrthographicCamera(0, 0, 0, 0, -2000, 2000);
 camera.position.z = 1000;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // кап DPR, щоб retina не з'їла fps / cap DPR so retina doesn't tank fps
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
@@ -18,7 +24,9 @@ document.body.appendChild(renderer.domElement);
 
 const PIXEL_RATIO = renderer.getPixelRatio();
 
-// --- BLOOM POST-PROCESSING ---
+// --- Bloom / світіння / Bloom pass ---
+// Тримаємо bloom слабким: частинки й так адитивні, сильний тільки вибілює колір.
+// Keep bloom weak: particles are additive already, cranking it just washes them white.
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
 
@@ -30,7 +38,8 @@ const bloomPass = new UnrealBloomPass(
 );
 composer.addPass(bloomPass);
 
-// --- ТЕКСТУРА ЧАСТИНКИ (для ядра) ---
+// Кругла градієнтна текстура для частинок ядра (м'яка пляма замість квадрата).
+// Radial-gradient sprite for the core particles (soft blob instead of a hard square).
 function getParticleTexture() {
     const canvas = document.createElement('canvas');
     canvas.width = 64;
@@ -46,12 +55,18 @@ function getParticleTexture() {
 }
 const particleTexture = getParticleTexture();
 
-// --- МЕНЕДЖЕР ВІКОН ---
+// --- Менеджер вікон / Window manager ---
+// Вікна знаходять одне одного через localStorage: кожне пише свій прямокутник і
+// читає чужі. Жодного бекенду — синхронізація суто на боці браузера.
+// Windows find each other through localStorage: each writes its own rect and reads
+// the others'. No backend — it's all client-side.
 class WindowManager {
     constructor() {
         this.id = `win_${Date.now()}_${Math.random()}`;
         this.winChangeCallback = null;
 
+        // Закриваючись, прибираємо себе зі спільного списку.
+        // On close, remove ourselves from the shared list.
         window.addEventListener('beforeunload', () => {
             const wins = this.getWindows();
             delete wins[this.id];
@@ -71,6 +86,8 @@ class WindowManager {
     update() {
         const wins = this.getWindows();
         const now = Date.now();
+        // Викидаємо вікна, що мовчать >1.5с (закрите або зависле).
+        // Drop windows that haven't pinged in >1.5s (closed or stuck).
         Object.keys(wins).forEach(id => {
             if (now - wins[id].timestamp > 1500 && id !== this.id) delete wins[id];
         });
@@ -85,7 +102,8 @@ class WindowManager {
 }
 const winManager = new WindowManager();
 
-// --- GLSL: 3D simplex noise (Ashima / Stefan Gustavson) ---
+// 3D simplex noise — Ashima Arts / Stefan Gustavson. Взято як є, форматування не чіпати.
+// 3D simplex noise — Ashima Arts / Stefan Gustavson. Vendored verbatim, don't reformat.
 const SNOISE_GLSL = `
 vec3 mod289(vec3 x){return x - floor(x*(1.0/289.0))*289.0;}
 vec4 mod289(vec4 x){return x - floor(x*(1.0/289.0))*289.0;}
@@ -135,7 +153,11 @@ float snoise(vec3 v){
 }
 `;
 
-// --- ШЕЙДЕР ОБОЛОНКИ (хмара частинок з шумовими "язиками") ---
+// --- Шейдер оболонки / Shell (membrane) shader ---
+// Точки лежать на одиничній сфері. Тут ми штовхаємо їх шумом (складки + "язики"),
+// проріджуємо за щільністю і, якщо поруч є сусід, витягуємо в лійку до нього.
+// Points sit on a unit sphere. Here we push them out with noise (folds + "tongues"),
+// thin them by density, and — if there's a neighbour — stretch them into a funnel toward it.
 const shellVertex = `
 uniform float uTime;
 uniform float uPixelRatio;
@@ -168,56 +190,69 @@ float hash13b(vec3 p){ return fract(sin(dot(p, vec3(39.346, 11.135, 83.155))) * 
 
 void main(){
     vec3 dir = normalize(position);
-    float h  = hash13(dir);
-    float h2 = hash13b(dir);   // незалежний хеш — рішення "показати/приховати"
+    float h  = hash13(dir);   // на точку: розмір + зсув радіуса / per-point: size + radial offset
+    float h2 = hash13b(dir);  // окремий "кубик": лишити чи сховати точку / separate dice: keep or hide the point
 
-    // Шумове поле, що повільно обертається і дрейфує — "тканина", що дихає
+    // Базовий шум повільно крутиться й пливе, тож тканина ніби дихає.
+    // Base noise slowly rotates + drifts, so the cloth looks like it's breathing.
     vec3 np = rotY(dir, uTime * uSpin);
     float n1 = snoise(np * uNoiseFreq + vec3(0.0, uTime * uSpeed, 0.0));
     float n2 = snoise(np * uNoiseFreq * 2.1 + vec3(uTime * uSpeed * 0.6, 0.0, 0.0)) * 0.5;
     float n = n1 + n2;
 
-    // "Язики полум'я" — м'які виступи лише там, де шум високий
+    // "Язики" — м'які випини там, де шум додатній (наче язики полум'я).
+    // "Tongues" — soft bulges where the noise is positive (flame-like).
     float tongue = pow(max(n, 0.0), 1.8);
 
-    // Волокна-складки тканини: гребені другого шуму (ridged noise) => точки
-    // групуються у звивисті нитки, як складки зім'ятої марлі
+    // Складки: гребені другого шуму збирають точки у звивисті нитки, як зім'ята
+    // марля, замість рівномірного пилу.
+    // Folds: ridges of a second noise gather points into winding threads — crumpled
+    // gauze rather than even dust.
     float rn  = snoise(np * uNoiseFreq * 2.6 + vec3(5.0, uTime * uSpeed * 0.4, 9.0));
     float fil = pow(1.0 - abs(rn), 3.0);
 
-    // Контур (силует) сфери: яскравіше там, де нормаль перпендикулярна до погляду.
-    // uRimSharp керує ТОВЩИНОЮ кільця: більше значення => тонший контур точно по краю.
+    // Силует: яскравіше там, де поверхня "на ребрі" до камери — так читається контур.
+    // uRimSharp = товщина обідка (більше => тонше).
+    // Silhouette: brighter where the surface is edge-on to the camera → the rim shows.
+    // uRimSharp is the ring thickness (higher => thinner).
     vec3 vn = normalize((modelViewMatrix * vec4(dir, 0.0)).xyz);
     float rim = pow(1.0 - abs(vn.z), uRimSharp);
 
-    // Лійка до сусідньої сфери: ділянка навколо осі витягується вздовж неї
-    // та стискається до осі — мембрана сама перетікає в трубку (без окремого моста)
+    // Наскільки точка дивиться на сусідню сферу — звідси росте лійка.
+    // How much this point faces the neighbour — the funnel grows out of this.
     float facing = max(dot(dir, uReachDir), 0.0);
     float w = smoothstep(0.45, 1.0, facing) * uReachAmount;
 
-    // Щільність точок: рідко на гладкій поверхні, гуще вздовж волокон і язиків,
-    // тонке кільце по краю; лійка не рідшає, коли тканина розтягується
+    // Шанс лишити точку: рідко на гладкому, густо на складках/язиках, тонке кільце
+    // по краю. Лійку не проріджуємо, інакше труба світилася б наскрізь.
+    // Keep-chance: sparse on smooth areas, dense on folds/tongues, thin ring at the
+    // rim. Don't thin the funnel or the tube would look see-through.
     float nl   = clamp(n * 0.5 + 0.5, 0.0, 1.0);
     float prob = fil * (uBaseDensity + uTongueDensity * smoothstep(0.35, 0.95, nl))
                + uRimDensity * rim * (0.45 + 0.55 * fil)
                + 0.35 * w;
-    if (h2 > prob) {                       // приховуємо зайві точки (за межі кадру)
+    if (h2 > prob) {          // не пройшло — паркуємо точку за кліпом / didn't pass — park it offscreen
         gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
         return;
     }
 
-    // Зміщення радіуса (тканина) + язики
+    // Виштовхуємо точку по радіусу: шум (тканина) + язики; h додає товщину оболонки.
+    // Push the point out along the radius: noise (cloth) + tongues; h adds shell thickness.
     float disp = uNoiseAmp * n + uTongueAmp * tongue;
     float baseR = uRadius + (h - 0.5) * uThickness;
     vec3 pos = dir * (baseR + disp);
 
-    // Деформація лійки: витягування вздовж осі + стискання до осі.
-    // Розкид довжини (h) розпушує кінчик — тканина м'яко згасає, а не ріжеться.
+    // Лійка: тягнемо вздовж осі до сусіда і стискаємо до неї — виходить труба, що
+    // звужується. Розкид по h "розпушує" кінчик, щоб тканина танула, а не різалась.
+    // Funnel: pull along the axis toward the neighbour and squeeze toward it — a tapering
+    // tube. Spreading by h feathers the tip so the cloth fades out instead of cutting off.
     float pull = pow(w, 1.7) * (0.7 + 0.6 * h);
     pos += uReachDir * pull * uReachLen;
     vec3 perp = pos - uReachDir * dot(pos, uReachDir);
     pos -= perp * 0.72 * smoothstep(0.2, 1.0, w);
 
+    // Яскравість/прозорість: підіймаємо на язиках, складках і обідку; на лійці гасимо.
+    // Glow/alpha: boosted on tongues, folds and rim; dimmed along the funnel.
     float pullFade = clamp(pull, 0.0, 1.0);
     vGlow  = tongue * 0.5 + fil * 0.35 + rim * 0.4;
     vAlpha = uOpacity * (0.22 + 0.55 * tongue + 0.35 * fil + uRimAlpha * rim)
@@ -233,7 +268,8 @@ uniform vec3 uColor;
 varying float vGlow;
 varying float vAlpha;
 void main(){
-    // М'яка кругла мікро-точка
+    // Ріжемо квадрат спрайта до круга — м'яка крапка.
+    // Carve the sprite quad down to a disc — a soft dot.
     float d = length(gl_PointCoord - vec2(0.5));
     if (d > 0.5) discard;
     float a = smoothstep(0.5, 0.0, d);
@@ -243,10 +279,13 @@ void main(){
 }
 `;
 
-// --- ГЕОМЕТРІЯ МЕМБРАНИ: хмара мікро-точок на сфері ---
-// Рівномірний ВИПАДКОВИЙ розподіл по сфері (z рівномірно, кут рівномірно) => жодної
-// регулярної структури: ні меридіанів/паралелей, ні ліній сітки. Лише дрібне зерно,
-// що при щільності читається як напівпрозора тканина ("обгортка" з мікрокрапок).
+// --- Геометрія оболонки: хмара мікро-точок / Shell geometry: micro-dot cloud ---
+// Рівномірно ВИПАДКОВІ точки на сфері (z рівномірний, кут рівномірний). Ніякої
+// сітки, меридіанів чи фібоначчі-спіралі — вони дають помітні візерунки. Лише
+// дрібне зерно, що при щільності читається як напівпрозора тканина.
+// Uniform RANDOM points on the sphere (z uniform, angle uniform). No grid, no
+// meridians, no fibonacci spiral — those all show patterns. Just fine grain that
+// reads as translucent cloth once it's dense enough.
 function buildShellGeometry(count) {
     const positions = new Float32Array(count * 3);
     for (let i = 0; i < count; i++) {
@@ -262,6 +301,8 @@ function buildShellGeometry(count) {
     return geo;
 }
 
+// Матеріал оболонки: усі "ручки" вигляду заходять через opts.
+// Shell material: every look-knob comes in through opts.
 function makeShellMaterial(color, opts) {
     return new THREE.ShaderMaterial({
         uniforms: {
@@ -295,7 +336,9 @@ function makeShellMaterial(color, opts) {
     });
 }
 
-// --- ВИПАДКОВІ ТОЧКИ ДЛЯ ОБ'ЄМНОГО ЯДРА ---
+// --- Точки в об'ємі кулі (ядро) / Points filling a ball (the core) ---
+// r через sqrt — не рівномірно по об'єму, трохи щільніше до краю. / sqrt radius —
+// not volume-uniform, a touch denser toward the outside.
 function randomSphericalPoints(count, radiusMin, radiusMax) {
     const positions = new Float32Array(count * 3);
     for (let i = 0; i < count; i++) {
@@ -309,16 +352,23 @@ function randomSphericalPoints(count, radiusMin, radiusMax) {
     return positions;
 }
 
-// --- СТВОРЕННЯ ГРУПИ СФЕРИ ---
-// children[0] — зовнішня мембрана Points (shellColor)
-// children[1] — внутрішня мембрана Points (coreColor)
-// children[2] — об'ємне ядро Points (coreColor)
-// frustumCulled=false скрізь: базова геометрія одинична, тож three.js рахує крихітну
-// bounding sphere і викидав би накриту фігуру, коли її центр виходить за межі вікна.
+// --- Складання групи однієї сфери / Assemble one sphere group ---
+// children[0] — зовнішня мембрана, [1] — внутрішня, [2] — ядро. Порядок важливий:
+// setReach()/updateScene() лізуть по цих індексах.
+// children[0] outer membrane, [1] inner, [2] core. Order matters — setReach()/
+// updateScene() reach in by index.
+//
+// frustumCulled=false усюди. Геометрія одинична (радіус ~1), справжній радіус
+// накручуємо в шейдері, тож three.js бачить bounding sphere ~1 і викидав би всю
+// фігуру, щойно її центр вийде за кадр (сусіднє чи накрите вікно). Назад НЕ вмикати.
+// frustumCulled=false everywhere. The geometry is a unit sphere; the real radius is
+// applied in the shader, so three.js sees a ~1 bounding sphere and would cull the whole
+// object the moment its centre leaves the view (a neighbouring or overlapping window).
+// Do not turn it back on.
 function createSphereGroup(shellColor, coreColor) {
     const group = new THREE.Group();
 
-    // Зовнішня мембрана — "тканина" з мікро-точок: рідка на гладкому, густа на язиках і по краю
+    // Зовнішня мембрана / Outer membrane.
     const outerShell = new THREE.Points(
         buildShellGeometry(75000),
         makeShellMaterial(shellColor, {
@@ -331,7 +381,7 @@ function createSphereGroup(shellColor, coreColor) {
     outerShell.frustumCulled = false;
     group.add(outerShell);
 
-    // Внутрішня мембрана — менша, щільніша, обертається в інший бік
+    // Внутрішня мембрана — менша, крутиться в інший бік / Inner membrane — smaller, spins the other way.
     const innerShell = new THREE.Points(
         buildShellGeometry(28000),
         makeShellMaterial(coreColor, {
@@ -344,7 +394,7 @@ function createSphereGroup(shellColor, coreColor) {
     innerShell.frustumCulled = false;
     group.add(innerShell);
 
-    // Ядро — щільна хмара дрібних частинок (стримана гаряча серцевина)
+    // Ядро — стримана гаряча серцевина / Core — a restrained hot centre.
     const coreGeo = new THREE.BufferGeometry();
     coreGeo.setAttribute('position', new THREE.BufferAttribute(
         randomSphericalPoints(850, 0, 32), 3
@@ -367,16 +417,20 @@ function createSphereGroup(shellColor, coreColor) {
     return group;
 }
 
-// --- СТАН СЦЕНИ ---
-// З'єднання двох сфер — НЕ окремий об'єкт: кожна мембрана сама витягується
-// в лійку до партнера (див. uReachDir/uReachLen у шейдері оболонки), тож
-// перехід зберігає колір кожної тканини без жовтого змішування.
+// --- Стан сцени / Scene state ---
+// Зв'язок двох сфер — це НЕ окремий об'єкт-міст. Кожна мембрана сама тягнеться в
+// лійку до партнера (uReachDir/uReachLen у шейдері), тому кольори не зливаються в
+// жовтий — кожна тканина лишається свого кольору.
+// The link between two spheres is NOT a separate bridge object. Each membrane stretches
+// itself into a funnel toward the partner (uReachDir/uReachLen in the shader), so the
+// colours never blend into yellow — each cloth keeps its own.
 const spheres     = new Map();
-const COLOR_GREEN = 0x63ffa6;   // м'ятно-зелений — з Приклад.webp
-const COLOR_RED   = 0xff2a64;   // малиновий — з Фото.png
+const COLOR_GREEN = 0x63ffa6;   // м'ятно-зелений, знятий з Приклад.webp / mint green sampled from Приклад.webp
+const COLOR_RED   = 0xff2a64;   // малиновий, знятий з Фото.png / crimson sampled from Фото.png
 
 const _reach = new THREE.Vector3();
 
+// Напрям і сила лійки для однієї сфери / Direction and strength of one sphere's funnel.
 function setReach(group, dirVec, amount, gap) {
     const outer = group.children[0].material.uniforms;
     const inner = group.children[1].material.uniforms;
@@ -384,19 +438,22 @@ function setReach(group, dirVec, amount, gap) {
     inner.uReachDir.value.copy(dirVec);
     outer.uReachAmount.value = amount;
     inner.uReachAmount.value = amount;
-    // Кінчики лійок мають зустрітися посередині; лійка починається з поверхні
-    // сфери (радіус ~100), тому віднімаємо його від половини відстані
+    // Кінчики двох лійок мають зустрітись посередині. Лійка стартує з поверхні
+    // (радіус ~100), тому віднімаємо його від півдистанції.
+    // The two funnel tips should meet in the middle. The funnel starts at the surface
+    // (radius ~100), so subtract that from half the gap.
     const stretch = Math.max(0, gap * 0.5 - 60);
     outer.uReachLen.value = stretch;
     inner.uReachLen.value = stretch * 0.45;
 }
 
+// Вимкнути лійку (сфера сама по собі) / Turn the funnel off (lone sphere).
 function clearReach(group) {
     group.children[0].material.uniforms.uReachAmount.value = 0;
     group.children[1].material.uniforms.uReachAmount.value = 0;
 }
 
-// --- ОНОВЛЕННЯ СЦЕНИ ---
+// --- Кадр: розкладаємо сфери по вікнах / Per-frame: lay spheres out by window ---
 function updateScene(time) {
     const wins  = winManager.update();
     const myWin = wins[winManager.id];
@@ -419,20 +476,21 @@ function updateScene(time) {
             spheres.set(id, group);
         }
 
-        // Оновлення кольорів (на випадок зміни порядку вікон)
+        // Колір міг помінятись, якщо змінився порядок вікон / colour may flip if window order changed.
         group.children[0].material.uniforms.uColor.value.setHex(shellColor);
         group.children[1].material.uniforms.uColor.value.setHex(coreColor);
         group.children[2].material.color.setHex(coreColor);
 
-        // Час анімації для шейдерів
+        // Час у шейдери / feed time to the shaders.
         group.children[0].material.uniforms.uTime.value = time;
         group.children[1].material.uniforms.uTime.value = time;
 
-        // М'яке обертання ядра
+        // Ядро ліниво крутиться / core spins lazily.
         group.children[2].rotation.y = time * 0.25;
         group.children[2].rotation.x = time * 0.12;
 
-        // Позиція відносно поточного вікна
+        // Позиція сфери = зсув центру її вікна від центру нашого (у пікселях).
+        // Sphere position = its window's centre offset from ours (in pixels).
         const wCX = winData.x + winData.w / 2;
         const wCY = winData.y + winData.h / 2;
         const pos = new THREE.Vector3(wCX - myCX, -(wCY - myCY), 0);
@@ -443,21 +501,22 @@ function updateScene(time) {
         sphereData.push({ group, pos, shellColor });
     });
 
-    // Видалення мертвих сфер
+    // Прибираємо сфери зниклих вікон / drop spheres whose window is gone.
     spheres.forEach((group, id) => {
         if (!wins[id]) { scene.remove(group); spheres.delete(id); }
     });
 
-    // Скидаємо тяжіння для всіх, далі ввімкнемо лише для з'єднаної пари
+    // Спершу гасимо лійки всім, далі ввімкнемо тільки парі / clear all funnels, then enable just the pair.
     sphereData.forEach(s => clearReach(s.group));
 
-    // Злиття тканин перших двох сфер: мембрани витягуються назустріч
+    // Перші дві сфери тягнуться одна до одної — тканини зливаються.
+    // The first two spheres reach for each other — their cloth merges.
     if (sphereData.length >= 2) {
         const a = sphereData[0];
         const b = sphereData[1];
         const gap = a.pos.distanceTo(b.pos);
 
-        // Сила злиття: повна зблизька, плавно згасає на великій відстані
+        // Зблизька — повне злиття, здалеку — плавно гасне / full merge up close, fades out with distance.
         const amount = THREE.MathUtils.clamp((980 - gap) / (980 - 230), 0, 1);
 
         if (gap > 1) {
@@ -469,7 +528,9 @@ function updateScene(time) {
     }
 }
 
-// --- RESIZE ---
+// --- Ресайз / Resize ---
+// Тримаємо масштаб "1 юніт = 1 піксель", інакше збіг сфер між вікнами поламається.
+// Keep the 1-unit-per-pixel scale, otherwise cross-window alignment breaks.
 function resize() {
     const w = window.innerWidth;
     const h = window.innerHeight;
@@ -483,7 +544,7 @@ function resize() {
 window.addEventListener('resize', resize);
 resize();
 
-// --- АНІМАЦІЯ ---
+// --- Головний цикл / Main loop ---
 function animate() {
     requestAnimationFrame(animate);
     const time = performance.now() * 0.001;

@@ -7,13 +7,18 @@
     <style>
         body {
             margin: 0;
-            overflow: hidden; /* Прибираємо смуги прокрутки */
-            background-color: #111; /* Темний фон, як на відео */
+            overflow: hidden;        /* канвас на весь екран / full-screen canvas, no scrollbars */
+            background-color: #111;  /*  майже чорний фон/ nearly black so the bloom reads well */
         }
         canvas {
-            display: block;
+            display: block;          /* прибираємо зайвий відступ під inline-канвасом / kill the inline-canvas gap */
         }
     </style>
+
+    <!--
+      three.js з CDN - потрібен HTTP-сервер (див. README)
+      three.js straight from a CDN - it needs an HTTP server (see README)
+    -->
     <script type="importmap">
         {
             "imports": {
@@ -24,6 +29,7 @@
     </script>
 </head>
 <body>
+    <!-- логіка тут / all the logic -->
     <script type="module" src="./main.js"></script>
 </body>
 </html>
